@@ -1,0 +1,14 @@
+[alias]
+# Generate an HTML coverage report with cargo-llvm-cov.
+coverage = "llvm-cov --workspace --all-features --html"
+
+# Enforce the same 80% intent as the Java JaCoCo gate.
+# Mapping:
+# - JaCoCo LINE        -> LLVM line coverage
+# - JaCoCo INSTRUCTION -> LLVM region coverage
+# - JaCoCo BRANCH      -> not currently exposed by rustc/cargo-llvm-cov
+# - JaCoCo CLASS       -> approximated by LLVM function coverage
+coverage-check = "llvm-cov --workspace --all-features --fail-under-lines 80 --fail-under-regions 80 --fail-under-functions 80"
+
+# Produce LCOV for SonarQube, Codecov, Coveralls, and similar tools.
+coverage-lcov = "llvm-cov --workspace --all-features --lcov --output-path lcov.info"
