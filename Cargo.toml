@@ -2,6 +2,12 @@
 name = "opentmf-rbac-security-rs"
 version = "0.1.0"
 edition = "2021"
+description = "Provider-neutral OpenID/JWT RBAC middleware for Axum and Tower"
+license = "Apache-2.0"
+repository = "https://github.com/opentmf-rs/opentmf-rbac-security-rs"
+readme = "README.md"
+keywords = ["opentmf", "rbac", "jwt", "axum", "tower"]
+categories = ["authentication", "web-programming"]
 
 [dependencies]
 axum = "0.8.9"
