@@ -26,6 +26,8 @@ pub enum JwtError {
     Header(jsonwebtoken::errors::Error),
     #[error("no usable JWK matched the token header")]
     NoMatchingKey,
+    #[error("JWK set is stale: {0}")]
+    JwksStale(String),
     #[error("token validation failed: {0}")]
     Validation(jsonwebtoken::errors::Error),
 }

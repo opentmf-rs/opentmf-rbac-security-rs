@@ -31,6 +31,10 @@ impl OpenTmfSecurityLayer {
         let validator = JwtValidator::from_config(&config).await?;
         Ok(Self::new(config, validator))
     }
+
+    pub fn jwks_health(&self) -> crate::jwt::JwksHealth {
+        self.validator.health()
+    }
 }
 
 impl<S> Layer<S> for OpenTmfSecurityLayer {
@@ -105,7 +109,7 @@ where
                 }
             };
 
-            let claims = match validator.validate(token) {
+            let claims = match validator.validate_async(token).await {
                 Ok(claims) => {
                     debug!("JWT token validated successfully");
                     claims

@@ -1,6 +1,7 @@
 use crate::error::ConfigError;
 use http::Method;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConfigFile {
@@ -25,6 +26,12 @@ pub struct SecurityConfig {
     pub fallback_user_claims: Vec<String>,
     #[serde(default = "default_authorities_claim")]
     pub authorities_claim: String,
+    #[serde(default = "default_jwks_refresh_interval", with = "duration_seconds")]
+    pub jwks_refresh_interval: Duration,
+    #[serde(default = "default_jwks_max_stale", with = "duration_seconds")]
+    pub jwks_max_stale: Duration,
+    #[serde(default = "default_jwks_request_timeout", with = "duration_seconds")]
+    pub jwks_request_timeout: Duration,
     #[serde(default)]
     pub secure_endpoints: Vec<SecureEndpoint>,
     #[serde(default)]
@@ -45,6 +52,9 @@ impl Default for SecurityConfig {
             user_claim: default_user_claim(),
             fallback_user_claims: Vec::new(),
             authorities_claim: default_authorities_claim(),
+            jwks_refresh_interval: default_jwks_refresh_interval(),
+            jwks_max_stale: default_jwks_max_stale(),
+            jwks_request_timeout: default_jwks_request_timeout(),
             secure_endpoints: Vec::new(),
             allowed_endpoints: Vec::new(),
             blacklist: Vec::new(),
@@ -122,11 +132,43 @@ fn default_authorities_claim() -> String {
     "roles".to_string()
 }
 
+fn default_jwks_refresh_interval() -> Duration {
+    Duration::from_secs(300)
+}
+
+fn default_jwks_max_stale() -> Duration {
+    Duration::from_secs(3600)
+}
+
+fn default_jwks_request_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
 fn validate_path(path: &str) -> Result<(), ConfigError> {
     if path.starts_with('/') {
         Ok(())
     } else {
         Err(ConfigError::InvalidPath(path.to_string()))
+    }
+}
+
+mod duration_seconds {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u64(duration.as_secs())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let seconds = u64::deserialize(deserializer)?;
+        Ok(Duration::from_secs(seconds))
     }
 }
 
@@ -163,6 +205,9 @@ mod tests {
 
         assert_eq!(config.user_claim, "sub");
         assert_eq!(config.authorities_claim, "roles");
+        assert_eq!(config.jwks_refresh_interval, Duration::from_secs(300));
+        assert_eq!(config.jwks_max_stale, Duration::from_secs(3600));
+        assert_eq!(config.jwks_request_timeout, Duration::from_secs(5));
         assert_eq!(config.other_endpoints, OtherEndpoints::Deny);
         assert!(config.issuer_uri.is_none());
         assert!(config.jwk_set_uri.is_none());
@@ -181,6 +226,9 @@ opentmf:
     user-claim: email
     fallback-user-claims: [client_id, azp, sub]
     authorities-claim: permissions
+    jwks-refresh-interval: 60
+    jwks-max-stale: 600
+    jwks-request-timeout: 3
     secure-endpoints:
       - method: POST
         path: /orders
@@ -198,6 +246,9 @@ opentmf:
         );
         assert_eq!(config.user_claim, "email");
         assert_eq!(config.authorities_claim, "permissions");
+        assert_eq!(config.jwks_refresh_interval, Duration::from_secs(60));
+        assert_eq!(config.jwks_max_stale, Duration::from_secs(600));
+        assert_eq!(config.jwks_request_timeout, Duration::from_secs(3));
         assert_eq!(config.secure_endpoints[0].method, Method::POST);
         assert_eq!(config.other_endpoints, OtherEndpoints::Authenticated);
     }

@@ -2,14 +2,40 @@ use crate::config::SecurityConfig;
 use crate::error::JwtError;
 use http::HeaderMap;
 use jsonwebtoken::jwk::{Jwk, JwkSet};
-use jsonwebtoken::{decode, decode_header, DecodingKey, TokenData, Validation};
+use jsonwebtoken::{decode, decode_header, DecodingKey, Header, TokenData, Validation};
 use serde::Deserialize;
 use serde_json::Value;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone)]
 pub struct JwtValidator {
-    keys: Vec<JwtKey>,
+    inner: Arc<JwtValidatorInner>,
+}
+
+#[derive(Debug)]
+struct JwtValidatorInner {
     issuer: Option<String>,
+    state: RwLock<JwksState>,
+    remote: Option<RemoteJwks>,
+    refresh_lock: Mutex<()>,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteJwks {
+    jwks_uri: String,
+    client: reqwest::Client,
+    refresh_interval: Duration,
+    max_stale: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct JwksState {
+    keys: Vec<JwtKey>,
+    last_success_at: Instant,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +49,21 @@ struct DiscoveryDocument {
     jwks_uri: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JwksHealth {
+    pub status: &'static str,
+    pub detail: String,
+    pub key_count: usize,
+    pub seconds_since_success: u64,
+    pub last_error: Option<String>,
+}
+
+impl JwksHealth {
+    pub fn is_up(&self) -> bool {
+        self.status == "UP"
+    }
+}
+
 impl JwtValidator {
     pub async fn from_config(config: &SecurityConfig) -> Result<Self, JwtError> {
         let jwks_uri = match &config.jwk_set_uri {
@@ -30,17 +71,70 @@ impl JwtValidator {
             None => discover_jwks_uri(config).await?,
         };
 
-        Self::from_jwks_uri(&jwks_uri, config.issuer_uri.clone()).await
+        Self::from_jwks_uri_with_options(
+            &jwks_uri,
+            config.issuer_uri.clone(),
+            config.jwks_refresh_interval,
+            config.jwks_max_stale,
+            config.jwks_request_timeout,
+        )
+        .await
     }
 
     pub async fn from_jwks_uri(jwks_uri: &str, issuer: Option<String>) -> Result<Self, JwtError> {
-        let body = reqwest::get(jwks_uri)
-            .await
-            .map_err(JwtError::JwksFetch)?
-            .text()
-            .await
+        Self::from_jwks_uri_with_options(
+            jwks_uri,
+            issuer,
+            Duration::from_secs(300),
+            Duration::from_secs(3600),
+            Duration::from_secs(5),
+        )
+        .await
+    }
+
+    pub async fn from_jwks_uri_with_options(
+        jwks_uri: &str,
+        issuer: Option<String>,
+        refresh_interval: Duration,
+        max_stale: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self, JwtError> {
+        let client = reqwest::Client::builder()
+            .timeout(request_timeout)
+            .build()
             .map_err(JwtError::JwksFetch)?;
-        Self::from_jwk_set_str(&body, issuer)
+        let remote = RemoteJwks {
+            jwks_uri: jwks_uri.to_string(),
+            client,
+            refresh_interval,
+            max_stale,
+        };
+        info!(
+            jwks_uri = %sanitize_uri(jwks_uri),
+            "Fetching JWKS during RBAC startup"
+        );
+        let keys = fetch_keys(&remote).await?;
+        let now = Instant::now();
+        info!(
+            jwks_uri = %sanitize_uri(jwks_uri),
+            key_count = keys.len(),
+            refresh_after_seconds = refresh_interval.as_secs(),
+            "JWKS startup fetch completed"
+        );
+        let validator = Self {
+            inner: Arc::new(JwtValidatorInner {
+                issuer,
+                state: RwLock::new(JwksState {
+                    keys,
+                    last_success_at: now,
+                    last_error: None,
+                }),
+                remote: Some(remote),
+                refresh_lock: Mutex::new(()),
+            }),
+        };
+        validator.spawn_refresh_task();
+        Ok(validator)
     }
 
     pub fn from_jwk_set_str(jwk_set_json: &str, issuer: Option<String>) -> Result<Self, JwtError> {
@@ -49,17 +143,24 @@ impl JwtValidator {
     }
 
     pub fn from_jwk_set(jwk_set: JwkSet, issuer: Option<String>) -> Result<Self, JwtError> {
-        let keys = jwk_set
-            .keys
-            .into_iter()
-            .filter_map(|jwk| jwk_to_key(jwk).ok())
-            .collect::<Vec<_>>();
+        let keys = jwk_set_to_keys(jwk_set)?;
+        Ok(Self::from_keys(keys, issuer, None))
+    }
 
-        if keys.is_empty() {
-            return Err(JwtError::NoMatchingKey);
+    fn from_keys(keys: Vec<JwtKey>, issuer: Option<String>, remote: Option<RemoteJwks>) -> Self {
+        let now = Instant::now();
+        Self {
+            inner: Arc::new(JwtValidatorInner {
+                issuer,
+                state: RwLock::new(JwksState {
+                    keys,
+                    last_success_at: now,
+                    last_error: None,
+                }),
+                remote,
+                refresh_lock: Mutex::new(()),
+            }),
         }
-
-        Ok(Self { keys, issuer })
     }
 
     pub fn from_decoding_key(
@@ -67,49 +168,202 @@ impl JwtValidator {
         decoding_key: DecodingKey,
         issuer: Option<String>,
     ) -> Self {
-        Self {
-            keys: vec![JwtKey {
+        Self::from_keys(
+            vec![JwtKey {
                 key_id,
                 decoding_key,
             }],
             issuer,
-        }
+            None,
+        )
     }
 
     pub fn validate(&self, token: &str) -> Result<Value, JwtError> {
         let header = decode_header(token).map_err(JwtError::Header)?;
-        let mut saw_matching_key = false;
-        let mut last_validation_error = None;
-        let matching_keys = self
-            .keys
-            .iter()
-            .filter(|key| match (&header.kid, &key.key_id) {
-                (Some(token_kid), Some(key_kid)) => token_kid == key_kid,
-                (Some(_), None) => false,
-                (None, _) => true,
-            });
+        let state = self.inner.state.read().expect("JWKS state lock poisoned");
+        self.ensure_not_stale(&state)?;
+        debug!(
+            key_count = state.keys.len(),
+            "Validating JWT with cached JWKS"
+        );
+        validate_with_keys(&state.keys, &self.inner.issuer, token, &header)
+    }
 
-        for key in matching_keys {
-            let mut validation = Validation::new(header.alg);
-            validation.validate_aud = false;
-            if let Some(issuer) = &self.issuer {
-                validation.set_issuer(&[issuer]);
-            }
-
-            let decoded: Result<TokenData<Value>, _> =
-                decode(token, &key.decoding_key, &validation);
-            saw_matching_key = true;
-            if let Ok(decoded) = decoded {
-                return Ok(decoded.claims);
-            } else if let Err(error) = decoded {
-                last_validation_error = Some(error);
+    pub async fn validate_async(&self, token: &str) -> Result<Value, JwtError> {
+        let header = decode_header(token).map_err(JwtError::Header)?;
+        {
+            let state = self.inner.state.read().expect("JWKS state lock poisoned");
+            self.ensure_not_stale(&state)?;
+            debug!(
+                key_count = state.keys.len(),
+                "Validating JWT with cached JWKS"
+            );
+            match validate_with_keys(&state.keys, &self.inner.issuer, token, &header) {
+                Ok(claims) => return Ok(claims),
+                Err(JwtError::NoMatchingKey)
+                    if header.kid.is_some() && self.inner.remote.is_some() => {}
+                Err(error) => return Err(error),
             }
         }
 
-        match (saw_matching_key, last_validation_error) {
-            (true, Some(error)) => Err(JwtError::Validation(error)),
-            _ => Err(JwtError::NoMatchingKey),
+        warn!(
+            kid = header.kid.as_deref().unwrap_or("<none>"),
+            "JWT kid was not found in cache; refreshing JWKS and retrying once"
+        );
+        self.refresh_now("unknown-kid").await?;
+        let state = self.inner.state.read().expect("JWKS state lock poisoned");
+        self.ensure_not_stale(&state)?;
+        validate_with_keys(&state.keys, &self.inner.issuer, token, &header)
+    }
+
+    pub async fn refresh_now(&self, reason: &'static str) -> Result<(), JwtError> {
+        let Some(remote) = self.inner.remote.clone() else {
+            return Ok(());
+        };
+        let _guard = self.inner.refresh_lock.lock().await;
+        info!(
+            jwks_uri = %sanitize_uri(&remote.jwks_uri),
+            reason,
+            "Refreshing JWKS"
+        );
+        match fetch_keys(&remote).await {
+            Ok(keys) => {
+                let key_count = keys.len();
+                let now = Instant::now();
+                let mut state = self.inner.state.write().expect("JWKS state lock poisoned");
+                state.keys = keys;
+                state.last_success_at = now;
+                state.last_error = None;
+                info!(
+                    jwks_uri = %sanitize_uri(&remote.jwks_uri),
+                    key_count,
+                    next_refresh_seconds = remote.refresh_interval.as_secs(),
+                    "JWKS refresh completed"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                let mut state = self.inner.state.write().expect("JWKS state lock poisoned");
+                state.last_error = Some(error.to_string());
+                let age = state.last_success_at.elapsed();
+                warn!(
+                    jwks_uri = %sanitize_uri(&remote.jwks_uri),
+                    error = %error,
+                    seconds_since_success = age.as_secs(),
+                    usable = age <= remote.max_stale,
+                    "JWKS refresh failed"
+                );
+                Err(error)
+            }
         }
+    }
+
+    pub fn health(&self) -> JwksHealth {
+        let state = self.inner.state.read().expect("JWKS state lock poisoned");
+        let seconds_since_success = state.last_success_at.elapsed().as_secs();
+        match &self.inner.remote {
+            Some(remote) if state.keys.is_empty() => JwksHealth {
+                status: "DOWN",
+                detail: format!("JWKS cache is empty for {}", sanitize_uri(&remote.jwks_uri)),
+                key_count: 0,
+                seconds_since_success,
+                last_error: state.last_error.clone(),
+            },
+            Some(remote) if state.last_success_at.elapsed() > remote.max_stale => JwksHealth {
+                status: "DOWN",
+                detail: format!(
+                    "JWKS cache is stale for {}; last success {} seconds ago",
+                    sanitize_uri(&remote.jwks_uri),
+                    seconds_since_success
+                ),
+                key_count: state.keys.len(),
+                seconds_since_success,
+                last_error: state.last_error.clone(),
+            },
+            Some(remote) => JwksHealth {
+                status: "UP",
+                detail: format!(
+                    "JWKS cache has {} keys from {}; last success {} seconds ago",
+                    state.keys.len(),
+                    sanitize_uri(&remote.jwks_uri),
+                    seconds_since_success
+                ),
+                key_count: state.keys.len(),
+                seconds_since_success,
+                last_error: state.last_error.clone(),
+            },
+            None => JwksHealth {
+                status: "UP",
+                detail: format!("static JWT key set has {} keys", state.keys.len()),
+                key_count: state.keys.len(),
+                seconds_since_success,
+                last_error: None,
+            },
+        }
+    }
+
+    fn spawn_refresh_task(&self) {
+        let Some(remote) = self.inner.remote.clone() else {
+            return;
+        };
+        let validator = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(remote.refresh_interval).await;
+                let _ = validator.refresh_now("scheduled").await;
+            }
+        });
+    }
+
+    fn ensure_not_stale(&self, state: &JwksState) -> Result<(), JwtError> {
+        let Some(remote) = &self.inner.remote else {
+            return Ok(());
+        };
+        let age = state.last_success_at.elapsed();
+        if age > remote.max_stale {
+            return Err(JwtError::JwksStale(format!(
+                "last successful refresh for {} was {} seconds ago",
+                sanitize_uri(&remote.jwks_uri),
+                age.as_secs()
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn validate_with_keys(
+    keys: &[JwtKey],
+    issuer: &Option<String>,
+    token: &str,
+    header: &Header,
+) -> Result<Value, JwtError> {
+    let mut saw_matching_key = false;
+    let mut last_validation_error = None;
+    let matching_keys = keys.iter().filter(|key| match (&header.kid, &key.key_id) {
+        (Some(token_kid), Some(key_kid)) => token_kid == key_kid,
+        (Some(_), None) => false,
+        (None, _) => true,
+    });
+
+    for key in matching_keys {
+        let mut validation = Validation::new(header.alg);
+        validation.validate_aud = false;
+        if let Some(issuer) = issuer {
+            validation.set_issuer(&[issuer]);
+        }
+
+        let decoded: Result<TokenData<Value>, _> = decode(token, &key.decoding_key, &validation);
+        saw_matching_key = true;
+        if let Ok(decoded) = decoded {
+            return Ok(decoded.claims);
+        } else if let Err(error) = decoded {
+            last_validation_error = Some(error);
+        }
+    }
+
+    match (saw_matching_key, last_validation_error) {
+        (true, Some(error)) => Err(JwtError::Validation(error)),
+        _ => Err(JwtError::NoMatchingKey),
     }
 }
 
@@ -141,6 +395,36 @@ async fn discover_jwks_uri(config: &SecurityConfig) -> Result<String, JwtError> 
     document.jwks_uri.ok_or(JwtError::MissingJwksUri)
 }
 
+async fn fetch_keys(remote: &RemoteJwks) -> Result<Vec<JwtKey>, JwtError> {
+    let body = remote
+        .client
+        .get(&remote.jwks_uri)
+        .send()
+        .await
+        .map_err(JwtError::JwksFetch)?
+        .error_for_status()
+        .map_err(JwtError::JwksFetch)?
+        .text()
+        .await
+        .map_err(JwtError::JwksFetch)?;
+    let jwk_set: JwkSet = serde_json::from_str(&body).map_err(JwtError::JwksParse)?;
+    jwk_set_to_keys(jwk_set)
+}
+
+fn jwk_set_to_keys(jwk_set: JwkSet) -> Result<Vec<JwtKey>, JwtError> {
+    let keys = jwk_set
+        .keys
+        .into_iter()
+        .filter_map(|jwk| jwk_to_key(jwk).ok())
+        .collect::<Vec<_>>();
+
+    if keys.is_empty() {
+        return Err(JwtError::NoMatchingKey);
+    }
+
+    Ok(keys)
+}
+
 fn jwk_to_key(jwk: Jwk) -> Result<JwtKey, jsonwebtoken::errors::Error> {
     let key_id = jwk.common.key_id.clone();
     let decoding_key = DecodingKey::from_jwk(&jwk)?;
@@ -150,11 +434,30 @@ fn jwk_to_key(jwk: Jwk) -> Result<JwtKey, jsonwebtoken::errors::Error> {
     })
 }
 
+fn sanitize_uri(uri: &str) -> String {
+    reqwest::Url::parse(uri)
+        .map(|url| {
+            let mut sanitized = String::new();
+            sanitized.push_str(url.scheme());
+            sanitized.push_str("://");
+            if let Some(host) = url.host_str() {
+                sanitized.push_str(host);
+            }
+            sanitized.push_str(url.path());
+            sanitized
+        })
+        .unwrap_or_else(|_| "<invalid-jwks-uri>".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::axum::routing::get;
+    use ::axum::Router;
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use serde_json::json;
+    use std::sync::{Arc, RwLock as StdRwLock};
+    use std::time::Duration;
 
     #[test]
     fn extracts_bearer_token() {
@@ -218,6 +521,17 @@ mod tests {
         let claims = validator.validate(&token).unwrap();
 
         assert_eq!(claims["sub"], "user-1");
+    }
+
+    #[test]
+    fn reports_static_jwks_health() {
+        let validator =
+            JwtValidator::from_decoding_key(None, DecodingKey::from_secret(b"secret"), None);
+
+        let health = validator.health();
+
+        assert!(health.is_up());
+        assert_eq!(health.key_count, 1);
     }
 
     #[test]
@@ -350,11 +664,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_kid_refreshes_jwks_and_retries_validation() {
+        let jwks = Arc::new(StdRwLock::new(oct_jwks("kid-1", "c2VjcmV0LW9uZQ")));
+        let jwks_url = spawn_jwks_server(Arc::clone(&jwks)).await;
+        let validator = JwtValidator::from_jwks_uri_with_options(
+            &jwks_url,
+            None,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        *jwks.write().unwrap() = oct_jwks("kid-2", "c2VjcmV0LXR3bw");
+        let token = token_with_kid("kid-2", b"secret-two");
+
+        let claims = validator.validate_async(&token).await.unwrap();
+
+        assert_eq!(claims["sub"], "user-1");
+        assert_eq!(validator.health().key_count, 1);
+        assert!(validator.health().is_up());
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_keeps_last_known_good_keys_healthy_until_stale() {
+        let jwks = Arc::new(StdRwLock::new(oct_jwks("kid-1", "c2VjcmV0LW9uZQ")));
+        let jwks_url = spawn_jwks_server(Arc::clone(&jwks)).await;
+        let validator = JwtValidator::from_jwks_uri_with_options(
+            &jwks_url,
+            None,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        *jwks.write().unwrap() = "not-json".to_string();
+        let error = validator.refresh_now("test").await.unwrap_err();
+
+        assert!(matches!(error, JwtError::JwksParse(_)));
+        let health = validator.health();
+        assert!(health.is_up());
+        assert_eq!(health.key_count, 1);
+        assert!(health.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_cache_reports_down_and_rejects_validation() {
+        let jwks = Arc::new(StdRwLock::new(oct_jwks("kid-1", "c2VjcmV0LW9uZQ")));
+        let jwks_url = spawn_jwks_server(Arc::clone(&jwks)).await;
+        let validator = JwtValidator::from_jwks_uri_with_options(
+            &jwks_url,
+            None,
+            Duration::from_secs(3600),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        {
+            let mut state = validator
+                .inner
+                .state
+                .write()
+                .expect("JWKS state lock poisoned");
+            state.last_success_at = Instant::now() - Duration::from_secs(2);
+        }
+        let token = token_with_kid("kid-1", b"secret-one");
+
+        let health = validator.health();
+        let error = validator.validate_async(&token).await.unwrap_err();
+
+        assert!(!health.is_up());
+        assert!(matches!(error, JwtError::JwksStale(_)));
+    }
+
+    #[tokio::test]
     async fn from_config_requires_jwks_or_issuer() {
         let error = JwtValidator::from_config(&SecurityConfig::default())
             .await
             .unwrap_err();
 
         assert!(matches!(error, JwtError::MissingJwksUri));
+    }
+
+    fn token_with_kid(kid: &str, secret: &[u8]) -> String {
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some(kid.to_string());
+        encode(
+            &header,
+            &json!({"sub": "user-1", "roles": ["admin"], "exp": 4_102_444_800i64}),
+            &EncodingKey::from_secret(secret),
+        )
+        .unwrap()
+    }
+
+    fn oct_jwks(kid: &str, secret_base64_url: &str) -> String {
+        json!({
+            "keys": [{
+                "kty": "oct",
+                "kid": kid,
+                "alg": "HS256",
+                "k": secret_base64_url
+            }]
+        })
+        .to_string()
+    }
+
+    async fn spawn_jwks_server(jwks: Arc<StdRwLock<String>>) -> String {
+        let app = Router::new().route(
+            "/jwks",
+            get(move || {
+                let jwks = Arc::clone(&jwks);
+                async move { jwks.read().unwrap().clone() }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = ::axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/jwks")
     }
 }

@@ -16,6 +16,6 @@ pub use crate::config::{
     ConfigFile, Endpoint, OpenTmfConfig, OtherEndpoints, SecureEndpoint, SecurityConfig,
 };
 pub use crate::error::{AuthError, ConfigError, JwtError};
-pub use crate::jwt::JwtValidator;
+pub use crate::jwt::{JwksHealth, JwtValidator};
 pub use crate::policy::{PolicyDecision, PolicyRequirement, SecurityPolicy};
 pub use crate::principal::Principal;

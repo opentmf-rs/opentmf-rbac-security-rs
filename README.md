@@ -29,6 +29,9 @@ opentmf:
     user-claim: email
     fallback-user-claims: [client_id, azp, sub]
     authorities-claim: permissions
+    jwks-refresh-interval: 300
+    jwks-max-stale: 3600
+    jwks-request-timeout: 5
 
     whitelist:
       - /health
@@ -84,6 +87,28 @@ Policy evaluation intentionally follows the Java library:
 3. `allowed-endpoints`: allow matching method + path without authentication.
 4. `secure-endpoints`: require any configured role/authority.
 5. `other-endpoints`: apply `allow`, `deny`, or `authenticated`.
+
+## JWKS Cache and Refresh
+
+When `jwk-set-uri` or `issuer-uri` is configured, the middleware fetches and
+parses the JWKS during startup. If this initial fetch fails, security layer
+construction fails and the application should not become ready.
+
+After startup, keys are kept in memory and refreshed in the background. The
+defaults are:
+
+- `jwks-refresh-interval: 300` seconds
+- `jwks-max-stale: 3600` seconds
+- `jwks-request-timeout: 5` seconds
+
+If a scheduled refresh fails, the last-known-good keys remain usable until the
+max stale window is exceeded. If a token arrives with an unknown `kid`, the
+validator refreshes JWKS immediately and retries validation once, which helps
+with identity-provider key rotation.
+
+The middleware emits structured `tracing` logs for startup fetch, scheduled
+refresh, refresh failures, and unknown-`kid` refresh attempts. It does not log
+raw JWTs, decoded claims, JWK material, or secrets.
 
 ## Provider Claim Mapping
 
