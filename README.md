@@ -107,8 +107,18 @@ validator refreshes JWKS immediately and retries validation once, which helps
 with identity-provider key rotation.
 
 The middleware emits structured `tracing` logs for startup fetch, scheduled
-refresh, refresh failures, and unknown-`kid` refresh attempts. It does not log
-raw JWTs, decoded claims, JWK material, or secrets.
+refresh, refresh failures, and unknown-`kid` refresh attempts. At `debug` level,
+JWKS HTTP fetches also log the outbound request method, sanitized request
+headers, empty request body marker, response status, sanitized response headers,
+and a bounded response body preview. Header values are redacted by sensitive
+name patterns such as `token`, `secret`, `password`, `credential`,
+`authorization`, `cookie`, `api-key`, `session`, `jwt`, `bearer`, `csrf`, and
+`xsrf`. Redacted headers remain visible as `"<redacted>"` so operators can tell
+that they were sent.
+
+The crate does not log raw JWTs, decoded claims, private keys, credentials, or
+secrets. JWKS response bodies contain public key material and are only logged at
+`debug` level with a bounded preview.
 
 ## Provider Claim Mapping
 

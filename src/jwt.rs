@@ -3,8 +3,9 @@ use crate::error::JwtError;
 use http::HeaderMap;
 use jsonwebtoken::jwk::{Jwk, JwkSet};
 use jsonwebtoken::{decode, decode_header, DecodingKey, Header, TokenData, Validation};
+use reqwest::header::{HeaderMap as ReqwestHeaderMap, HeaderValue as ReqwestHeaderValue};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -396,17 +397,42 @@ async fn discover_jwks_uri(config: &SecurityConfig) -> Result<String, JwtError> 
 }
 
 async fn fetch_keys(remote: &RemoteJwks) -> Result<Vec<JwtKey>, JwtError> {
-    let body = remote
+    let request = remote
         .client
         .get(&remote.jwks_uri)
-        .send()
-        .await
-        .map_err(JwtError::JwksFetch)?
-        .error_for_status()
-        .map_err(JwtError::JwksFetch)?
-        .text()
+        .build()
+        .map_err(JwtError::JwksFetch)?;
+    debug!(
+        method = %request.method(),
+        jwks_uri = %sanitize_uri(request.url().as_str()),
+        request_headers = %sanitized_headers(request.headers()),
+        request_body = "<empty>",
+        "JWKS HTTP request prepared"
+    );
+
+    let response = remote
+        .client
+        .execute(request)
         .await
         .map_err(JwtError::JwksFetch)?;
+    let status = response.status();
+    let response_headers = sanitized_headers(response.headers());
+
+    let status_error = response.error_for_status_ref().err();
+    let body = response.text().await.map_err(JwtError::JwksFetch)?;
+    let preview = body_preview(&body, 4096);
+    debug!(
+        status = status.as_u16(),
+        response_headers = %response_headers,
+        response_body_preview = %preview.preview,
+        response_body_truncated = preview.truncated,
+        "JWKS HTTP response received"
+    );
+
+    if let Some(error) = status_error {
+        return Err(JwtError::JwksFetch(error));
+    }
+
     let jwk_set: JwkSet = serde_json::from_str(&body).map_err(JwtError::JwksParse)?;
     jwk_set_to_keys(jwk_set)
 }
@@ -447,6 +473,87 @@ fn sanitize_uri(uri: &str) -> String {
             sanitized
         })
         .unwrap_or_else(|_| "<invalid-jwks-uri>".to_string())
+}
+
+fn sanitized_headers(headers: &ReqwestHeaderMap) -> Value {
+    let mut values = Map::new();
+
+    for (name, value) in headers {
+        let name = name.as_str().to_ascii_lowercase();
+        let value = sanitized_header_value(&name, value);
+
+        match values.get_mut(&name) {
+            Some(Value::Array(existing)) => existing.push(value),
+            Some(existing) => {
+                let first = std::mem::replace(existing, Value::Null);
+                *existing = Value::Array(vec![first, value]);
+            }
+            None => {
+                values.insert(name, value);
+            }
+        }
+    }
+
+    Value::Object(values)
+}
+
+fn sanitized_header_value(name: &str, value: &ReqwestHeaderValue) -> Value {
+    if is_sensitive_header_name(name) {
+        return Value::String("<redacted>".to_string());
+    }
+
+    match value.to_str() {
+        Ok(value) => Value::String(value.to_string()),
+        Err(_) => Value::String("<non-utf8>".to_string()),
+    }
+}
+
+fn is_sensitive_header_name(name: &str) -> bool {
+    const SENSITIVE_PATTERNS: &[&str] = &[
+        "token",
+        "secret",
+        "password",
+        "credential",
+        "authorization",
+        "cookie",
+        "api-key",
+        "apikey",
+        "session",
+        "jwt",
+        "bearer",
+        "csrf",
+        "xsrf",
+    ];
+
+    let name = name.to_ascii_lowercase();
+    SENSITIVE_PATTERNS
+        .iter()
+        .any(|pattern| name.contains(pattern))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BodyPreview {
+    preview: String,
+    truncated: bool,
+}
+
+fn body_preview(body: &str, max_bytes: usize) -> BodyPreview {
+    if body.len() <= max_bytes {
+        return BodyPreview {
+            preview: body.to_string(),
+            truncated: false,
+        };
+    }
+
+    let mut end = max_bytes;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    BodyPreview {
+        preview: body[..end].to_string(),
+        truncated: true,
+    }
 }
 
 #[cfg(test)]
@@ -771,6 +878,38 @@ mod tests {
             }]
         })
         .to_string()
+    }
+
+    #[test]
+    fn redacts_sensitive_jwks_http_headers_by_pattern() {
+        let mut headers = ReqwestHeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            "Bearer secret-token".parse().unwrap(),
+        );
+        headers.insert("x-api-key", "secret".parse().unwrap());
+        headers.insert("x-session-id", "session".parse().unwrap());
+        headers.insert(reqwest::header::ACCEPT, "application/json".parse().unwrap());
+
+        let sanitized = sanitized_headers(&headers);
+
+        assert_eq!(sanitized["authorization"], "<redacted>");
+        assert_eq!(sanitized["x-api-key"], "<redacted>");
+        assert_eq!(sanitized["x-session-id"], "<redacted>");
+        assert_eq!(sanitized["accept"], "application/json");
+    }
+
+    #[test]
+    fn body_preview_is_bounded_and_utf8_safe() {
+        let body = "abc-şğü";
+        let preview = body_preview(body, 6);
+
+        assert_eq!(preview.preview, "abc-ş");
+        assert!(preview.truncated);
+
+        let full = body_preview(body, 1024);
+        assert_eq!(full.preview, body);
+        assert!(!full.truncated);
     }
 
     async fn spawn_jwks_server(jwks: Arc<StdRwLock<String>>) -> String {

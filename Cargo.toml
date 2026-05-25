@@ -1,6 +1,6 @@
 [package]
 name = "opentmf-rbac-security-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Provider-neutral OpenID/JWT RBAC middleware for Axum and Tower"
 license = "Apache-2.0"
