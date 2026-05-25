@@ -78,6 +78,7 @@ impl JwtValidator {
             config.jwks_refresh_interval,
             config.jwks_max_stale,
             config.jwks_request_timeout,
+            config.jwks_accept_invalid_certs,
         )
         .await
     }
@@ -89,6 +90,7 @@ impl JwtValidator {
             Duration::from_secs(300),
             Duration::from_secs(3600),
             Duration::from_secs(5),
+            false,
         )
         .await
     }
@@ -99,9 +101,17 @@ impl JwtValidator {
         refresh_interval: Duration,
         max_stale: Duration,
         request_timeout: Duration,
+        accept_invalid_certs: bool,
     ) -> Result<Self, JwtError> {
+        if accept_invalid_certs {
+            warn!(
+                jwks_uri = %sanitize_uri(jwks_uri),
+                "JWKS TLS certificate verification is disabled; use only as a temporary non-production workaround"
+            );
+        }
         let client = reqwest::Client::builder()
             .timeout(request_timeout)
+            .danger_accept_invalid_certs(accept_invalid_certs)
             .build()
             .map_err(JwtError::JwksFetch)?;
         let remote = RemoteJwks {
@@ -780,6 +790,7 @@ mod tests {
             Duration::from_secs(3600),
             Duration::from_secs(3600),
             Duration::from_secs(5),
+            false,
         )
         .await
         .unwrap();
@@ -804,6 +815,7 @@ mod tests {
             Duration::from_secs(3600),
             Duration::from_secs(3600),
             Duration::from_secs(5),
+            false,
         )
         .await
         .unwrap();
@@ -828,6 +840,7 @@ mod tests {
             Duration::from_secs(3600),
             Duration::from_secs(1),
             Duration::from_secs(5),
+            false,
         )
         .await
         .unwrap();

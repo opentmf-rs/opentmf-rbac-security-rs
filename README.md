@@ -32,6 +32,7 @@ opentmf:
     jwks-refresh-interval: 300
     jwks-max-stale: 3600
     jwks-request-timeout: 5
+    jwks-accept-invalid-certs: false
 
     whitelist:
       - /health
@@ -100,6 +101,7 @@ defaults are:
 - `jwks-refresh-interval: 300` seconds
 - `jwks-max-stale: 3600` seconds
 - `jwks-request-timeout: 5` seconds
+- `jwks-accept-invalid-certs: false`
 
 If a scheduled refresh fails, the last-known-good keys remain usable until the
 max stale window is exceeded. If a token arrives with an unknown `kid`, the
@@ -119,6 +121,11 @@ that they were sent.
 The crate does not log raw JWTs, decoded claims, private keys, credentials, or
 secrets. JWKS response bodies contain public key material and are only logged at
 `debug` level with a bounded preview.
+
+For temporary non-production troubleshooting, `jwks-accept-invalid-certs: true`
+can be used to disable TLS certificate verification for JWKS HTTP calls. This is
+dangerous and should not be used in production; the preferred fix is to install
+the correct CA certificate or fix the issuer's certificate chain.
 
 ## Provider Claim Mapping
 

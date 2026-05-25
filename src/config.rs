@@ -33,6 +33,8 @@ pub struct SecurityConfig {
     #[serde(default = "default_jwks_request_timeout", with = "duration_seconds")]
     pub jwks_request_timeout: Duration,
     #[serde(default)]
+    pub jwks_accept_invalid_certs: bool,
+    #[serde(default)]
     pub secure_endpoints: Vec<SecureEndpoint>,
     #[serde(default)]
     pub allowed_endpoints: Vec<Endpoint>,
@@ -55,6 +57,7 @@ impl Default for SecurityConfig {
             jwks_refresh_interval: default_jwks_refresh_interval(),
             jwks_max_stale: default_jwks_max_stale(),
             jwks_request_timeout: default_jwks_request_timeout(),
+            jwks_accept_invalid_certs: false,
             secure_endpoints: Vec::new(),
             allowed_endpoints: Vec::new(),
             blacklist: Vec::new(),
@@ -208,6 +211,7 @@ mod tests {
         assert_eq!(config.jwks_refresh_interval, Duration::from_secs(300));
         assert_eq!(config.jwks_max_stale, Duration::from_secs(3600));
         assert_eq!(config.jwks_request_timeout, Duration::from_secs(5));
+        assert!(!config.jwks_accept_invalid_certs);
         assert_eq!(config.other_endpoints, OtherEndpoints::Deny);
         assert!(config.issuer_uri.is_none());
         assert!(config.jwk_set_uri.is_none());
@@ -229,6 +233,7 @@ opentmf:
     jwks-refresh-interval: 60
     jwks-max-stale: 600
     jwks-request-timeout: 3
+    jwks-accept-invalid-certs: true
     secure-endpoints:
       - method: POST
         path: /orders
@@ -249,6 +254,7 @@ opentmf:
         assert_eq!(config.jwks_refresh_interval, Duration::from_secs(60));
         assert_eq!(config.jwks_max_stale, Duration::from_secs(600));
         assert_eq!(config.jwks_request_timeout, Duration::from_secs(3));
+        assert!(config.jwks_accept_invalid_certs);
         assert_eq!(config.secure_endpoints[0].method, Method::POST);
         assert_eq!(config.other_endpoints, OtherEndpoints::Authenticated);
     }
